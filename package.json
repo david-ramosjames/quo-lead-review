@@ -1,0 +1,25 @@
+{
+  "name": "quo-transcripts",
+  "version": "1.0.0",
+  "description": "Export Quo call transcripts to CSV",
+  "main": "fetch_calls.js",
+  "scripts": {
+    "start": "node scheduler.js",
+    "fetch": "node fetch_calls.js",
+    "report": "node report.js",
+    "schedule": "node scheduler.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@slack/web-api": "^7.15.0",
+    "axios": "^1.7.9",
+    "dotenv": "^16.4.7",
+    "googleapis": "^171.4.0",
+    "luxon": "^3.7.2",
+    "node-cron": "^3.0.3",
+    "nodemailer": "^8.0.4",
+    "openai": "^4.85.4"
+  }
+}
