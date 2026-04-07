@@ -392,14 +392,37 @@ function buildEmailHtml(analysis, stats, dateLabel, variant = 'lead') {
 </html>`;
 }
 
-async function sendEmail({ htmlBody, plainText, subject, attachments = [] }) {
-  const transporter = nodemailer.createTransport({
+function createMailTransporter() {
+  return nodemailer.createTransport({
     host: SMTP_HOST,
     port: SMTP_PORT,
     secure: SMTP_PORT === 465,
     auth: { user: SMTP_USER, pass: SMTP_PASS },
+    // Explicit timeouts so a stuck SMTP connection fails fast and can be retried
+    // instead of hanging forever (nodemailer defaults are lenient).
+    connectionTimeout: 30_000,
+    greetingTimeout:   30_000,
+    socketTimeout:     60_000,
+    pool: false,
   });
+}
 
+function isTransientSmtpError(err) {
+  const code = err && (err.code || err.errno);
+  if (!code) return false;
+  return [
+    'ETIMEDOUT',
+    'ESOCKET',
+    'ECONNECTION',
+    'ECONNRESET',
+    'ECONNREFUSED',
+    'EDNS',
+    'EAI_AGAIN',
+    'EPROTOCOL',
+  ].includes(code);
+}
+
+async function sendEmail({ htmlBody, plainText, subject, attachments = [] }) {
   const mail = {
     from: EMAIL_FROM,
     to: EMAIL_TO.join(', '),
@@ -409,7 +432,29 @@ async function sendEmail({ htmlBody, plainText, subject, attachments = [] }) {
   };
   if (attachments.length) mail.attachments = attachments;
 
-  await transporter.sendMail(mail);
+  const MAX_ATTEMPTS = 4;
+  let lastErr;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    const transporter = createMailTransporter();
+    try {
+      await transporter.sendMail(mail);
+      return;
+    } catch (err) {
+      lastErr = err;
+      const transient = isTransientSmtpError(err) || /timeout/i.test(err.message || '');
+      if (!transient || attempt === MAX_ATTEMPTS) {
+        throw err;
+      }
+      const backoffMs = 2000 * 2 ** (attempt - 1); // 2s, 4s, 8s
+      console.warn(
+        `  SMTP send attempt ${attempt}/${MAX_ATTEMPTS} failed (${err.code || err.message}); retrying in ${backoffMs / 1000}s...`
+      );
+      await new Promise((r) => setTimeout(r, backoffMs));
+    } finally {
+      try { transporter.close(); } catch (_) { /* ignore */ }
+    }
+  }
+  throw lastErr;
 }
 
 // ── Main report runner ────────────────────────────────────────────────────────
@@ -529,10 +574,8 @@ async function runDailyReport() {
   }
 
   // 7–8. Email — Call Report includes CSV; Lead Report has no attachment
-  console.log('\n[7/8] Sending Daily Call Report email (with CSV)...');
-  console.log('\n[8/8] Sending Daily Lead Report email (no CSV)...');
   if (!EMAIL_TO.length || !SMTP_HOST) {
-    console.log('  Email not configured — printing reports:\n');
+    console.log('\n[7/8] Email not configured — printing reports:\n');
     console.log('\n--- Daily Call Report ---\n');
     console.log(callAnalysis);
     console.log('\n--- Daily Lead Report ---\n');
@@ -542,6 +585,8 @@ async function runDailyReport() {
     const leadSubject = `🎯 Daily Lead Report — ${dayOfWeek}, ${dateLabel}`;
     const callHtml    = buildEmailHtml(callAnalysis, stats, dateLabel, 'call');
     const leadHtml    = buildEmailHtml(leadAnalysis, stats, dateLabel, 'lead');
+
+    console.log('\n[7/8] Sending Daily Call Report email (with CSV)...');
     await sendEmail({
       htmlBody: callHtml,
       plainText: callAnalysis,
@@ -550,13 +595,18 @@ async function runDailyReport() {
         { filename: path.basename(csvFilename), path: csvFilename },
       ],
     });
+    console.log('  Sent.');
+
+    console.log('\n[8/8] Sending Daily Lead Report email (no CSV)...');
     await sendEmail({
       htmlBody: leadHtml,
       plainText: leadAnalysis,
       subject: leadSubject,
       attachments: [],
     });
-    console.log(`  Sent both to: ${EMAIL_TO.join(', ')}`);
+    console.log('  Sent.');
+
+    console.log(`\n  Delivered both to: ${EMAIL_TO.join(', ')}`);
   }
 
   console.log(`\n${'═'.repeat(52)}`);
