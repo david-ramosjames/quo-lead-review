@@ -404,6 +404,9 @@ function createMailTransporter() {
     greetingTimeout:   30_000,
     socketTimeout:     60_000,
     pool: false,
+    // Uncomment for verbose SMTP trace when debugging:
+    // logger: true,
+    // debug: true,
   });
 }
 
@@ -422,6 +425,21 @@ function isTransientSmtpError(err) {
   ].includes(code);
 }
 
+/**
+ * Hard outer deadline so sendMail() can never hang the whole job even if
+ * nodemailer's own timeouts fail to fire (has happened during STARTTLS).
+ */
+function withHardTimeout(promise, ms, label) {
+  let timer;
+  const deadline = new Promise((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`${label} hard timeout after ${ms}ms`)),
+      ms
+    );
+  });
+  return Promise.race([promise, deadline]).finally(() => clearTimeout(timer));
+}
+
 async function sendEmail({ htmlBody, plainText, subject, attachments = [] }) {
   const mail = {
     from: EMAIL_FROM,
@@ -433,22 +451,34 @@ async function sendEmail({ htmlBody, plainText, subject, attachments = [] }) {
   if (attachments.length) mail.attachments = attachments;
 
   const MAX_ATTEMPTS = 4;
+  const HARD_TIMEOUT_MS = 120_000; // 2 min absolute cap per attempt
   let lastErr;
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     const transporter = createMailTransporter();
     try {
-      await transporter.sendMail(mail);
+      if (attempt === 1) {
+        // Verify connectivity first so a dead SMTP host fails with a clear
+        // error instead of looking like a sendMail hang.
+        await withHardTimeout(transporter.verify(), 45_000, 'SMTP verify');
+      }
+      await withHardTimeout(
+        transporter.sendMail(mail),
+        HARD_TIMEOUT_MS,
+        'SMTP sendMail'
+      );
       return;
     } catch (err) {
       lastErr = err;
-      const transient = isTransientSmtpError(err) || /timeout/i.test(err.message || '');
+      const transient =
+        isTransientSmtpError(err) || /timeout/i.test(err.message || '');
+      console.warn(
+        `  SMTP attempt ${attempt}/${MAX_ATTEMPTS} failed: ${err.code || ''} ${err.message || err}`
+      );
       if (!transient || attempt === MAX_ATTEMPTS) {
         throw err;
       }
       const backoffMs = 2000 * 2 ** (attempt - 1); // 2s, 4s, 8s
-      console.warn(
-        `  SMTP send attempt ${attempt}/${MAX_ATTEMPTS} failed (${err.code || err.message}); retrying in ${backoffMs / 1000}s...`
-      );
+      console.warn(`  Retrying in ${backoffMs / 1000}s...`);
       await new Promise((r) => setTimeout(r, backoffMs));
     } finally {
       try { transporter.close(); } catch (_) { /* ignore */ }
@@ -573,6 +603,22 @@ async function runDailyReport() {
     console.log('  Done.');
   }
 
+  // Persist analyses to disk BEFORE touching email. If the process is killed
+  // during email sending (OOM, SIGTERM, nodemailer hang) we still have the
+  // day's reports on disk and can resend manually.
+  const datePrefix   = createdAfter.slice(0, 10);
+  const callOutPath  = `quo_daily_call_report_${datePrefix}.md`;
+  const leadOutPath  = `quo_daily_lead_report_${datePrefix}.md`;
+  try {
+    fs.writeFileSync(callOutPath, callAnalysis || '', 'utf8');
+    fs.writeFileSync(leadOutPath, leadAnalysis || '', 'utf8');
+    console.log(
+      `  Saved analyses to disk: ${callOutPath} (${(callAnalysis || '').length} chars), ${leadOutPath} (${(leadAnalysis || '').length} chars)`
+    );
+  } catch (err) {
+    console.warn(`  Could not persist analyses to disk: ${err.message}`);
+  }
+
   // 7–8. Email — Call Report includes CSV; Lead Report has no attachment
   if (!EMAIL_TO.length || !SMTP_HOST) {
     console.log('\n[7/8] Email not configured — printing reports:\n');
@@ -581,32 +627,53 @@ async function runDailyReport() {
     console.log('\n--- Daily Lead Report ---\n');
     console.log(leadAnalysis);
   } else {
+    console.log(
+      `\n  Email config: host=${SMTP_HOST} port=${SMTP_PORT} secure=${SMTP_PORT === 465} from=${EMAIL_FROM} to=${EMAIL_TO.join(',')}`
+    );
+
+    console.log('\n[7/8] Building Daily Call Report email body...');
     const callSubject = `📞 Daily Call Report — ${dayOfWeek}, ${dateLabel}`;
-    const leadSubject = `🎯 Daily Lead Report — ${dayOfWeek}, ${dateLabel}`;
     const callHtml    = buildEmailHtml(callAnalysis, stats, dateLabel, 'call');
+    console.log(`  HTML body built (${callHtml.length} chars).`);
+
+    console.log('[7/8] Sending Daily Call Report email (with CSV)...');
+    try {
+      await sendEmail({
+        htmlBody: callHtml,
+        plainText: callAnalysis,
+        subject: callSubject,
+        attachments: [
+          { filename: path.basename(csvFilename), path: csvFilename },
+        ],
+      });
+      console.log(`  Sent to: ${EMAIL_TO.join(', ')}`);
+    } catch (err) {
+      console.error(
+        `  Daily Call Report email FAILED: ${err.code || ''} ${err.message || err}`
+      );
+      if (err.response) console.error(`  SMTP response: ${err.response}`);
+    }
+
+    console.log('\n[8/8] Building Daily Lead Report email body...');
+    const leadSubject = `🎯 Daily Lead Report — ${dayOfWeek}, ${dateLabel}`;
     const leadHtml    = buildEmailHtml(leadAnalysis, stats, dateLabel, 'lead');
+    console.log(`  HTML body built (${leadHtml.length} chars).`);
 
-    console.log('\n[7/8] Sending Daily Call Report email (with CSV)...');
-    await sendEmail({
-      htmlBody: callHtml,
-      plainText: callAnalysis,
-      subject: callSubject,
-      attachments: [
-        { filename: path.basename(csvFilename), path: csvFilename },
-      ],
-    });
-    console.log('  Sent.');
-
-    console.log('\n[8/8] Sending Daily Lead Report email (no CSV)...');
-    await sendEmail({
-      htmlBody: leadHtml,
-      plainText: leadAnalysis,
-      subject: leadSubject,
-      attachments: [],
-    });
-    console.log('  Sent.');
-
-    console.log(`\n  Delivered both to: ${EMAIL_TO.join(', ')}`);
+    console.log('[8/8] Sending Daily Lead Report email (no CSV)...');
+    try {
+      await sendEmail({
+        htmlBody: leadHtml,
+        plainText: leadAnalysis,
+        subject: leadSubject,
+        attachments: [],
+      });
+      console.log(`  Sent to: ${EMAIL_TO.join(', ')}`);
+    } catch (err) {
+      console.error(
+        `  Daily Lead Report email FAILED: ${err.code || ''} ${err.message || err}`
+      );
+      if (err.response) console.error(`  SMTP response: ${err.response}`);
+    }
   }
 
   console.log(`\n${'═'.repeat(52)}`);
