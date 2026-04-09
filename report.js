@@ -3,6 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const { DateTime } = require('luxon');
 const nodemailer = require('nodemailer');
+const { google } = require('googleapis');
 const OpenAI = require('openai');
 const { runExport } = require('./fetch_calls');
 const {
@@ -10,7 +11,7 @@ const {
   generateDailyLeadReportPrompt,
 } = require('./prompts');
 const { fetchSlackMessages, formatSlackForPrompt } = require('./slack');
-const { getLeadPipelineText } = require('./sheets');
+const { makeAuthClient, getLeadPipelineText } = require('./sheets');
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -43,10 +44,6 @@ const GOOGLE_SHEETS_RANGE = (process.env.GOOGLE_SHEETS_RANGE ?? '').trim();
 
 const EMAIL_FROM = process.env.EMAIL_FROM;
 const EMAIL_TO   = process.env.EMAIL_TO?.split(',').map((e) => e.trim()).filter(Boolean) || [];
-const SMTP_HOST  = process.env.SMTP_HOST;
-const SMTP_PORT  = parseInt(process.env.SMTP_PORT || '587', 10);
-const SMTP_USER  = process.env.SMTP_USER;
-const SMTP_PASS  = process.env.SMTP_PASS;
 
 // ── Date helpers ──────────────────────────────────────────────────────────────
 
@@ -392,14 +389,12 @@ function buildEmailHtml(analysis, stats, dateLabel, variant = 'lead') {
 </html>`;
 }
 
+/**
+ * Build a raw RFC 2822 MIME message using nodemailer's MailComposer,
+ * then send it via the Gmail API (HTTP — no SMTP ports needed).
+ */
 async function sendEmail({ htmlBody, plainText, subject, attachments = [] }) {
-  const transporter = nodemailer.createTransport({
-    host: SMTP_HOST,
-    port: SMTP_PORT,
-    secure: SMTP_PORT === 465,
-    auth: { user: SMTP_USER, pass: SMTP_PASS },
-  });
-
+  const MailComposer = require('nodemailer/lib/mail-composer');
   const mail = {
     from: EMAIL_FROM,
     to: EMAIL_TO.join(', '),
@@ -409,7 +404,18 @@ async function sendEmail({ htmlBody, plainText, subject, attachments = [] }) {
   };
   if (attachments.length) mail.attachments = attachments;
 
-  await transporter.sendMail(mail);
+  // Build the raw MIME message
+  const composer = new MailComposer(mail);
+  const message = await composer.compile().build();
+  const raw = message.toString('base64url');
+
+  // Send via Gmail API (reuses the same Google OAuth creds as Sheets)
+  const auth = makeAuthClient();
+  const gmail = google.gmail({ version: 'v1', auth });
+  await gmail.users.messages.send({
+    userId: 'me',
+    requestBody: { raw },
+  });
 }
 
 // ── Main report runner ────────────────────────────────────────────────────────
@@ -528,35 +534,67 @@ async function runDailyReport() {
     console.log('  Done.');
   }
 
-  // 7–8. Email — Call Report includes CSV; Lead Report has no attachment
-  console.log('\n[7/8] Sending Daily Call Report email (with CSV)...');
-  console.log('\n[8/8] Sending Daily Lead Report email (no CSV)...');
-  if (!EMAIL_TO.length || !SMTP_HOST) {
-    console.log('  Email not configured — printing reports:\n');
+  // Persist analyses to disk BEFORE touching email. If the process is killed
+  // during email sending (OOM, SIGTERM, nodemailer hang) we still have the
+  // day's reports on disk and can resend manually.
+  const datePrefix   = createdAfter.slice(0, 10);
+  const callOutPath  = `quo_daily_call_report_${datePrefix}.md`;
+  const leadOutPath  = `quo_daily_lead_report_${datePrefix}.md`;
+  try {
+    fs.writeFileSync(callOutPath, callAnalysis || '', 'utf8');
+    fs.writeFileSync(leadOutPath, leadAnalysis || '', 'utf8');
+    console.log(
+      `  Saved analyses to disk: ${callOutPath} (${(callAnalysis || '').length} chars), ${leadOutPath} (${(leadAnalysis || '').length} chars)`
+    );
+  } catch (err) {
+    console.warn(`  Could not persist analyses to disk: ${err.message}`);
+  }
+
+  // 7–8. Email via Gmail API (uses same Google OAuth creds as Sheets)
+  if (!EMAIL_TO.length || !EMAIL_FROM) {
+    console.log('\n[7/8] Email not configured — printing reports:\n');
     console.log('\n--- Daily Call Report ---\n');
     console.log(callAnalysis);
     console.log('\n--- Daily Lead Report ---\n');
     console.log(leadAnalysis);
   } else {
+    console.log(`\n  Email via Gmail API: from=${EMAIL_FROM} to=${EMAIL_TO.join(',')}`);
+
+    console.log('\n[7/8] Sending Daily Call Report email (with CSV)...');
     const callSubject = `📞 Daily Call Report — ${dayOfWeek}, ${dateLabel}`;
-    const leadSubject = `🎯 Daily Lead Report — ${dayOfWeek}, ${dateLabel}`;
     const callHtml    = buildEmailHtml(callAnalysis, stats, dateLabel, 'call');
+    try {
+      await sendEmail({
+        htmlBody: callHtml,
+        plainText: callAnalysis,
+        subject: callSubject,
+        attachments: [
+          { filename: path.basename(csvFilename), path: csvFilename },
+        ],
+      });
+      console.log(`  Sent to: ${EMAIL_TO.join(', ')}`);
+    } catch (err) {
+      console.error(
+        `  Daily Call Report email FAILED: ${err.code || ''} ${err.message || err}`
+      );
+    }
+
+    console.log('\n[8/8] Sending Daily Lead Report email (no CSV)...');
+    const leadSubject = `🎯 Daily Lead Report — ${dayOfWeek}, ${dateLabel}`;
     const leadHtml    = buildEmailHtml(leadAnalysis, stats, dateLabel, 'lead');
-    await sendEmail({
-      htmlBody: callHtml,
-      plainText: callAnalysis,
-      subject: callSubject,
-      attachments: [
-        { filename: path.basename(csvFilename), path: csvFilename },
-      ],
-    });
-    await sendEmail({
-      htmlBody: leadHtml,
-      plainText: leadAnalysis,
-      subject: leadSubject,
-      attachments: [],
-    });
-    console.log(`  Sent both to: ${EMAIL_TO.join(', ')}`);
+    try {
+      await sendEmail({
+        htmlBody: leadHtml,
+        plainText: leadAnalysis,
+        subject: leadSubject,
+        attachments: [],
+      });
+      console.log(`  Sent to: ${EMAIL_TO.join(', ')}`);
+    } catch (err) {
+      console.error(
+        `  Daily Lead Report email FAILED: ${err.code || ''} ${err.message || err}`
+      );
+    }
   }
 
   console.log(`\n${'═'.repeat(52)}`);
