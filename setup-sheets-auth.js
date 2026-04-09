@@ -13,7 +13,10 @@ const CLIENT_ID     = process.env.GOOGLE_CLIENT_ID;
 const CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
 const PORT          = 3000;
 const REDIRECT_URI  = `http://localhost:${PORT}/callback`;
-const SCOPES        = ['https://www.googleapis.com/auth/spreadsheets.readonly'];
+const SCOPES        = [
+  'https://www.googleapis.com/auth/spreadsheets.readonly',
+  'https://www.googleapis.com/auth/gmail.send',
+];
 const ENV_FILE      = '.env';
 
 if (!CLIENT_ID || !CLIENT_SECRET) {

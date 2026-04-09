@@ -3,6 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const { DateTime } = require('luxon');
 const nodemailer = require('nodemailer');
+const { google } = require('googleapis');
 const OpenAI = require('openai');
 const { runExport } = require('./fetch_calls');
 const {
@@ -10,7 +11,7 @@ const {
   generateDailyLeadReportPrompt,
 } = require('./prompts');
 const { fetchSlackMessages, formatSlackForPrompt } = require('./slack');
-const { getLeadPipelineText } = require('./sheets');
+const { makeAuthClient, getLeadPipelineText } = require('./sheets');
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -43,10 +44,6 @@ const GOOGLE_SHEETS_RANGE = (process.env.GOOGLE_SHEETS_RANGE ?? '').trim();
 
 const EMAIL_FROM = process.env.EMAIL_FROM;
 const EMAIL_TO   = process.env.EMAIL_TO?.split(',').map((e) => e.trim()).filter(Boolean) || [];
-const SMTP_HOST  = process.env.SMTP_HOST;
-const SMTP_PORT  = parseInt(process.env.SMTP_PORT || '587', 10);
-const SMTP_USER  = process.env.SMTP_USER;
-const SMTP_PASS  = process.env.SMTP_PASS;
 
 // ── Date helpers ──────────────────────────────────────────────────────────────
 
@@ -392,55 +389,12 @@ function buildEmailHtml(analysis, stats, dateLabel, variant = 'lead') {
 </html>`;
 }
 
-function createMailTransporter() {
-  return nodemailer.createTransport({
-    host: SMTP_HOST,
-    port: SMTP_PORT,
-    secure: SMTP_PORT === 465,
-    auth: { user: SMTP_USER, pass: SMTP_PASS },
-    // Explicit timeouts so a stuck SMTP connection fails fast and can be retried
-    // instead of hanging forever (nodemailer defaults are lenient).
-    connectionTimeout: 30_000,
-    greetingTimeout:   30_000,
-    socketTimeout:     60_000,
-    pool: false,
-    // Uncomment for verbose SMTP trace when debugging:
-    // logger: true,
-    // debug: true,
-  });
-}
-
-function isTransientSmtpError(err) {
-  const code = err && (err.code || err.errno);
-  if (!code) return false;
-  return [
-    'ETIMEDOUT',
-    'ESOCKET',
-    'ECONNECTION',
-    'ECONNRESET',
-    'ECONNREFUSED',
-    'EDNS',
-    'EAI_AGAIN',
-    'EPROTOCOL',
-  ].includes(code);
-}
-
 /**
- * Hard outer deadline so sendMail() can never hang the whole job even if
- * nodemailer's own timeouts fail to fire (has happened during STARTTLS).
+ * Build a raw RFC 2822 MIME message using nodemailer's MailComposer,
+ * then send it via the Gmail API (HTTP — no SMTP ports needed).
  */
-function withHardTimeout(promise, ms, label) {
-  let timer;
-  const deadline = new Promise((_, reject) => {
-    timer = setTimeout(
-      () => reject(new Error(`${label} hard timeout after ${ms}ms`)),
-      ms
-    );
-  });
-  return Promise.race([promise, deadline]).finally(() => clearTimeout(timer));
-}
-
 async function sendEmail({ htmlBody, plainText, subject, attachments = [] }) {
+  const MailComposer = require('nodemailer/lib/mail-composer');
   const mail = {
     from: EMAIL_FROM,
     to: EMAIL_TO.join(', '),
@@ -450,41 +404,18 @@ async function sendEmail({ htmlBody, plainText, subject, attachments = [] }) {
   };
   if (attachments.length) mail.attachments = attachments;
 
-  const MAX_ATTEMPTS = 4;
-  const HARD_TIMEOUT_MS = 120_000; // 2 min absolute cap per attempt
-  let lastErr;
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    const transporter = createMailTransporter();
-    try {
-      if (attempt === 1) {
-        // Verify connectivity first so a dead SMTP host fails with a clear
-        // error instead of looking like a sendMail hang.
-        await withHardTimeout(transporter.verify(), 45_000, 'SMTP verify');
-      }
-      await withHardTimeout(
-        transporter.sendMail(mail),
-        HARD_TIMEOUT_MS,
-        'SMTP sendMail'
-      );
-      return;
-    } catch (err) {
-      lastErr = err;
-      const transient =
-        isTransientSmtpError(err) || /timeout/i.test(err.message || '');
-      console.warn(
-        `  SMTP attempt ${attempt}/${MAX_ATTEMPTS} failed: ${err.code || ''} ${err.message || err}`
-      );
-      if (!transient || attempt === MAX_ATTEMPTS) {
-        throw err;
-      }
-      const backoffMs = 2000 * 2 ** (attempt - 1); // 2s, 4s, 8s
-      console.warn(`  Retrying in ${backoffMs / 1000}s...`);
-      await new Promise((r) => setTimeout(r, backoffMs));
-    } finally {
-      try { transporter.close(); } catch (_) { /* ignore */ }
-    }
-  }
-  throw lastErr;
+  // Build the raw MIME message
+  const composer = new MailComposer(mail);
+  const message = await composer.compile().build();
+  const raw = message.toString('base64url');
+
+  // Send via Gmail API (reuses the same Google OAuth creds as Sheets)
+  const auth = makeAuthClient();
+  const gmail = google.gmail({ version: 'v1', auth });
+  await gmail.users.messages.send({
+    userId: 'me',
+    requestBody: { raw },
+  });
 }
 
 // ── Main report runner ────────────────────────────────────────────────────────
@@ -619,24 +550,19 @@ async function runDailyReport() {
     console.warn(`  Could not persist analyses to disk: ${err.message}`);
   }
 
-  // 7–8. Email — Call Report includes CSV; Lead Report has no attachment
-  if (!EMAIL_TO.length || !SMTP_HOST) {
+  // 7–8. Email via Gmail API (uses same Google OAuth creds as Sheets)
+  if (!EMAIL_TO.length || !EMAIL_FROM) {
     console.log('\n[7/8] Email not configured — printing reports:\n');
     console.log('\n--- Daily Call Report ---\n');
     console.log(callAnalysis);
     console.log('\n--- Daily Lead Report ---\n');
     console.log(leadAnalysis);
   } else {
-    console.log(
-      `\n  Email config: host=${SMTP_HOST} port=${SMTP_PORT} secure=${SMTP_PORT === 465} from=${EMAIL_FROM} to=${EMAIL_TO.join(',')}`
-    );
+    console.log(`\n  Email via Gmail API: from=${EMAIL_FROM} to=${EMAIL_TO.join(',')}`);
 
-    console.log('\n[7/8] Building Daily Call Report email body...');
+    console.log('\n[7/8] Sending Daily Call Report email (with CSV)...');
     const callSubject = `📞 Daily Call Report — ${dayOfWeek}, ${dateLabel}`;
     const callHtml    = buildEmailHtml(callAnalysis, stats, dateLabel, 'call');
-    console.log(`  HTML body built (${callHtml.length} chars).`);
-
-    console.log('[7/8] Sending Daily Call Report email (with CSV)...');
     try {
       await sendEmail({
         htmlBody: callHtml,
@@ -651,15 +577,11 @@ async function runDailyReport() {
       console.error(
         `  Daily Call Report email FAILED: ${err.code || ''} ${err.message || err}`
       );
-      if (err.response) console.error(`  SMTP response: ${err.response}`);
     }
 
-    console.log('\n[8/8] Building Daily Lead Report email body...');
+    console.log('\n[8/8] Sending Daily Lead Report email (no CSV)...');
     const leadSubject = `🎯 Daily Lead Report — ${dayOfWeek}, ${dateLabel}`;
     const leadHtml    = buildEmailHtml(leadAnalysis, stats, dateLabel, 'lead');
-    console.log(`  HTML body built (${leadHtml.length} chars).`);
-
-    console.log('[8/8] Sending Daily Lead Report email (no CSV)...');
     try {
       await sendEmail({
         htmlBody: leadHtml,
@@ -672,7 +594,6 @@ async function runDailyReport() {
       console.error(
         `  Daily Lead Report email FAILED: ${err.code || ''} ${err.message || err}`
       );
-      if (err.response) console.error(`  SMTP response: ${err.response}`);
     }
   }
 
